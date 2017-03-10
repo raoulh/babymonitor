@@ -103,6 +103,8 @@ type Config struct {
 
 	//Time to wait before the trigger can be enabled again
 	TriggerPauseSec int64 `json:"trigger_pause_sec"`
+
+	Mp3LameQuality int `json:"mp3_lame_quality"`
 }
 
 func readConfig(c string) (err error) {
@@ -202,9 +204,7 @@ func startBabymonitor() (err error) {
 		defer mp3File.Close()
 
 		mp3Writer = lame.NewWriter(mp3File)
-		mp3Writer.Encoder.SetNumChannels(1)
-		mp3Writer.Encoder.SetInSamplerate(sampleRate)
-		mp3Writer.Encoder.InitParams()
+		setupMp3Parameters(mp3Writer)
 	}
 
 	keyChan := make(chan int)
@@ -308,8 +308,14 @@ readLoop:
 	err = httpSrv.Shutdown(ctx)
 
 	stream.Stop()
-	waveWriter.Close()
-	mp3Writer.Close()
+
+	if config.DebugWav.Enabled {
+		waveWriter.Close()
+	}
+
+	if config.DebugMp3.Enabled {
+		mp3Writer.Close()
+	}
 
 	return
 }
@@ -354,9 +360,7 @@ func streamHandler() http.Handler {
 
 		//setup the mp3 writer
 		c.mp3Writer = lame.NewWriter(w)
-		c.mp3Writer.Encoder.SetNumChannels(1)
-		c.mp3Writer.Encoder.SetInSamplerate(sampleRate)
-		c.mp3Writer.Encoder.InitParams()
+		setupMp3Parameters(c.mp3Writer)
 
 		//Add the client to the list
 		mutexClients.Lock()
@@ -456,4 +460,12 @@ func callAction(reqtype string, url string, data []byte) (_ []byte, err error) {
 	}
 
 	return ioutil.ReadAll(resp.Body)
+}
+
+func setupMp3Parameters(w *lame.LameWriter) {
+	w.Encoder.SetNumChannels(1)
+	w.Encoder.SetInSamplerate(sampleRate)
+	w.Encoder.SetMode(lame.MONO)
+	w.Encoder.SetQuality(config.Mp3LameQuality)
+	w.Encoder.InitParams()
 }
