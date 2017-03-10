@@ -7,9 +7,14 @@ import (
 	"io/ioutil"
 	"log"
 	"math"
+	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"sync"
 	"text/template"
+
+	"golang.org/x/net/context"
 
 	"github.com/gordonklaus/portaudio"
 	"github.com/nsf/termbox-go"
@@ -20,7 +25,22 @@ import (
 
 var (
 	config Config
+
+	mutexClients  = &sync.Mutex{} //mutex that prevents multiple access of the clientRequest map
+	clientRequest map[*http.Request]*Client
 )
+
+const (
+	serverUA = "Babymonitor/1.0"
+
+	sampleRate = 44100
+)
+
+type Client struct {
+	mp3Writer *lame.LameWriter //lame mp3 encoder
+
+	chanEnd chan bool
+}
 
 var tmpl = template.Must(template.New("").Parse(
 	`{{. | len}} host APIs: {{range .}}
@@ -42,7 +62,8 @@ var tmpl = template.Must(template.New("").Parse(
 
 type Config struct {
 	FFmpegArgs string   `json:"ffmpeg_args"`
-	actions    []string `json:"actions"`
+	Actions    []string `json:"actions"`
+	HttpPort   int      `json:"http_port"`
 }
 
 func readConfig(c string) (err error) {
@@ -81,6 +102,8 @@ func startBabymonitor() (err error) {
 	portaudio.Initialize()
 	defer portaudio.Terminate()
 
+	clientRequest = make(map[*http.Request]*Client)
+
 	hs, err := portaudio.HostApis()
 	if err != nil {
 		return
@@ -95,8 +118,7 @@ func startBabymonitor() (err error) {
 
 	inputChannels := 1
 	outputChannels := 0
-	sampleRate := 44100
-	framesPerBuffer := make([]int16, 10)
+	framesPerBuffer := make([]int16, 128)
 
 	log.Printf("Open default sound input device")
 	stream, err := portaudio.OpenDefaultStream(inputChannels, outputChannels, float64(sampleRate), len(framesPerBuffer), framesPerBuffer)
@@ -162,6 +184,8 @@ func startBabymonitor() (err error) {
 	bar := progress.New(1000)
 	bar.Format = progress.ProgressFormats[8]
 
+	httpSrv := startHttpStreamingServer()
+
 readLoop:
 	for {
 		err = stream.Read()
@@ -181,6 +205,11 @@ readLoop:
 			break readLoop
 		}
 		//		fmt.Println(framesPerBuffer)
+
+		//Write mp3 to all connected clients
+		for _, client := range clientRequest {
+			client.writeDataClient(&framesPerBuffer)
+		}
 
 		//calc mean value
 		var mean uint64
@@ -205,11 +234,91 @@ readLoop:
 		}
 	}
 
+	//release all remaining client
+	for _, client := range clientRequest {
+		client.chanEnd <- true //release client
+	}
+
 	//Clean up
 	log.Println("Stop. Cleaning...")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err = httpSrv.Shutdown(ctx)
+
 	stream.Stop()
 	waveWriter.Close()
 	mp3Writer.Close()
 
 	return
+}
+
+func startHttpStreamingServer() *http.Server {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
+
+	http.Handle("/stream", streamHandler())
+
+	srv := &http.Server{Addr: ":" + strconv.Itoa(config.HttpPort)}
+
+	go func() {
+		log.Println("Starting HTTP server, port", config.HttpPort)
+		if err := srv.ListenAndServe(); err != nil {
+			log.Printf("Httpserver: ListenAndServe() error: %s", err)
+		}
+	}()
+
+	return srv
+}
+
+func streamHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			//Use default go serve handler
+			http.DefaultServeMux.ServeHTTP(w, r)
+			return
+		}
+
+		log.Println("New client for streaming:", r.RemoteAddr)
+
+		w.Header().Set("Server", serverUA)
+		w.Header().Set("Content-Type", "audio/mpeg")
+		w.WriteHeader(201)
+
+		c := &Client{
+			//buffWriter: bufio.NewWriter(w),
+			chanEnd: make(chan bool, 1),
+		}
+
+		//setup the mp3 writer
+		c.mp3Writer = lame.NewWriter(w)
+		c.mp3Writer.Encoder.SetNumChannels(1)
+		c.mp3Writer.Encoder.SetInSamplerate(sampleRate)
+		c.mp3Writer.Encoder.InitParams()
+
+		//Add the client to the list
+		mutexClients.Lock()
+		clientRequest[r] = c
+		mutexClients.Unlock()
+
+		//Wait for an eventual end from writer.
+		//If client closes the connection a write error will occur
+		//If sound read/mp3 encode is failing, an error will occur
+		//and client will need to quit
+		<-clientRequest[r].chanEnd
+
+		mutexClients.Lock()
+		delete(clientRequest, r)
+		mutexClients.Unlock()
+
+		log.Println("Closing HTTP client:", r.RemoteAddr)
+	})
+}
+
+func (c *Client) writeDataClient(pcmData *[]int16) {
+	if err := binary.Write(c.mp3Writer, binary.LittleEndian, pcmData); err != nil {
+		log.Println("Failed to write data to client", err)
+		c.chanEnd <- true //release client
+	}
 }
