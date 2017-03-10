@@ -1,9 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
-	_ "fmt"
 	"io/ioutil"
 	"log"
 	"math"
@@ -12,15 +12,18 @@ import (
 	"os/signal"
 	"strconv"
 	"sync"
+	"syscall"
 	"text/template"
+	"time"
 
 	"golang.org/x/net/context"
 
 	"github.com/gordonklaus/portaudio"
+	"github.com/mattn/go-isatty"
 	"github.com/nsf/termbox-go"
 	"github.com/raoulh/babymonitor/lame"
 	"github.com/raoulh/go-progress"
-	wave "github.com/zenwerk/go-wave"
+	"github.com/zenwerk/go-wave"
 )
 
 var (
@@ -28,12 +31,26 @@ var (
 
 	mutexClients  = &sync.Mutex{} //mutex that prevents multiple access of the clientRequest map
 	clientRequest map[*http.Request]*Client
+
+	//debug writers
+	mp3Writer  *lame.LameWriter
+	waveWriter *wave.Writer
+
+	//how much sample we need for mesuring level
+	measSampleCount    int
+	samplesLevels      []int16
+	samplesBufferCount int
+
+	mutexBuff = &sync.Mutex{} //mutex for accessing the buffer
+
+	triggerTimestamp int64
 )
 
 const (
 	serverUA = "Babymonitor/1.0"
 
-	sampleRate = 44100
+	sampleRate   = 44100
+	samplesCount = 128 //number of sample to read each time
 )
 
 type Client struct {
@@ -61,9 +78,31 @@ var tmpl = template.Must(template.New("").Parse(
 ))
 
 type Config struct {
-	FFmpegArgs string   `json:"ffmpeg_args"`
-	Actions    []string `json:"actions"`
-	HttpPort   int      `json:"http_port"`
+	FFmpegArgs string `json:"ffmpeg_args"`
+	Actions    []struct {
+		Url     string `json:"url"`
+		Type    string `json:"type"`
+		Payload string `json:"payload"`
+	} `json:"actions"`
+	HttpPort int `json:"http_port"`
+
+	DebugMp3 struct {
+		Enabled  bool   `json:"enabled"`
+		Filename string `json:"filename"`
+	} `json:"debug_mp3"`
+
+	DebugWav struct {
+		Enabled  bool   `json:"enabled"`
+		Filename string `json:"filename"`
+	} `json:"debug_wav"`
+
+	LevelTrigger struct {
+		MeasureTime int     `json:"measure_time_ms"`
+		Level       float64 `json:"level"`
+	} `json:"level_trigger"`
+
+	//Time to wait before the trigger can be enabled again
+	TriggerPauseSec int64 `json:"trigger_pause_sec"`
 }
 
 func readConfig(c string) (err error) {
@@ -79,6 +118,10 @@ func readConfig(c string) (err error) {
 		log.Println("Unmarshal config file failed")
 		return
 	}
+
+	measSampleCount = config.LevelTrigger.MeasureTime * sampleRate / 1000
+	samplesLevels = make([]int16, measSampleCount/samplesCount+measSampleCount%samplesCount)
+	triggerTimestamp = time.Now().Unix() - config.TriggerPauseSec
 
 	return
 }
@@ -114,11 +157,11 @@ func startBabymonitor() (err error) {
 	}
 
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, os.Kill)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
 	inputChannels := 1
 	outputChannels := 0
-	framesPerBuffer := make([]int16, 128)
+	framesPerBuffer := make([]int16, samplesCount)
 
 	log.Printf("Open default sound input device")
 	stream, err := portaudio.OpenDefaultStream(inputChannels, outputChannels, float64(sampleRate), len(framesPerBuffer), framesPerBuffer)
@@ -133,32 +176,36 @@ func startBabymonitor() (err error) {
 		return
 	}
 
-	waveFile, err := os.Create("test.wav")
-	if err != nil {
-		return
-	}
-	defer waveFile.Close()
-	param := wave.WriterParam{
-		Out:           waveFile,
-		Channel:       inputChannels,
-		SampleRate:    sampleRate,
-		BitsPerSample: 16,
-	}
-	waveWriter, err := wave.NewWriter(param)
-	if err != nil {
-		return
+	if config.DebugWav.Enabled {
+		waveFile, err := os.Create(config.DebugWav.Filename)
+		if err != nil {
+			return err
+		}
+		defer waveFile.Close()
+		param := wave.WriterParam{
+			Out:           waveFile,
+			Channel:       inputChannels,
+			SampleRate:    sampleRate,
+			BitsPerSample: 16,
+		}
+		waveWriter, err = wave.NewWriter(param)
+		if err != nil {
+			return err
+		}
 	}
 
-	mp3File, err := os.Create("output.mp3")
-	if err != nil {
-		return
-	}
-	defer mp3File.Close()
+	if config.DebugMp3.Enabled {
+		mp3File, err := os.Create(config.DebugMp3.Filename)
+		if err != nil {
+			return err
+		}
+		defer mp3File.Close()
 
-	mp3Writer := lame.NewWriter(mp3File)
-	mp3Writer.Encoder.SetNumChannels(1)
-	mp3Writer.Encoder.SetInSamplerate(sampleRate)
-	mp3Writer.Encoder.InitParams()
+		mp3Writer = lame.NewWriter(mp3File)
+		mp3Writer.Encoder.SetNumChannels(1)
+		mp3Writer.Encoder.SetInSamplerate(sampleRate)
+		mp3Writer.Encoder.InitParams()
+	}
 
 	keyChan := make(chan int)
 	go func() {
@@ -181,8 +228,11 @@ func startBabymonitor() (err error) {
 		}
 	}()
 
-	bar := progress.New(1000)
-	bar.Format = progress.ProgressFormats[8]
+	var bar *progress.ProgressBar
+	if isatty.IsTerminal(os.Stdout.Fd()) {
+		bar = progress.New(1000)
+		bar.Format = progress.ProgressFormats[8]
+	}
 
 	httpSrv := startHttpStreamingServer()
 
@@ -195,33 +245,44 @@ readLoop:
 			break readLoop
 		}
 
-		//binary.Write(f, binary.BigEndian, in)
-		//		_, err := waveWriter.Write([]byte(framesPerBuffer))
-
-		binary.Write(waveWriter, binary.LittleEndian, framesPerBuffer)
-		binary.Write(mp3Writer, binary.LittleEndian, framesPerBuffer)
-		if err != nil {
-			termbox.Interrupt()
-			break readLoop
+		if config.DebugWav.Enabled {
+			binary.Write(waveWriter, binary.LittleEndian, framesPerBuffer)
+			if err != nil {
+				termbox.Interrupt()
+				break readLoop
+			}
 		}
-		//		fmt.Println(framesPerBuffer)
+
+		if config.DebugMp3.Enabled {
+			binary.Write(mp3Writer, binary.LittleEndian, framesPerBuffer)
+			if err != nil {
+				termbox.Interrupt()
+				break readLoop
+			}
+		}
 
 		//Write mp3 to all connected clients
 		for _, client := range clientRequest {
 			client.writeDataClient(&framesPerBuffer)
 		}
 
-		//calc mean value
-		var mean uint64
-		for _, v := range framesPerBuffer {
-			if v < 0 {
-				v = -v //Abs
+		//if we are on a terminal display a nice level bar
+		if isatty.IsTerminal(os.Stdout.Fd()) {
+			//calc mean value
+			var mean uint64
+			for _, v := range framesPerBuffer {
+				if v < 0 {
+					v = -v //Abs
+				}
+				mean += uint64(v)
 			}
-			mean += uint64(v)
+			mean /= uint64(len(framesPerBuffer))
+			mean = mean * 1000 / math.MaxInt16
+			bar.Set(int(mean))
 		}
-		mean /= uint64(len(framesPerBuffer))
-		mean = mean * 1000 / math.MaxInt16
-		bar.Set(int(mean))
+
+		//Check for level trigger
+		processLevelTrigger(framesPerBuffer)
 
 		select {
 		case <-sig:
@@ -321,4 +382,78 @@ func (c *Client) writeDataClient(pcmData *[]int16) {
 		log.Println("Failed to write data to client", err)
 		c.chanEnd <- true //release client
 	}
+}
+
+func processLevelTrigger(pcmData []int16) {
+	mutexBuff.Lock()
+	defer mutexBuff.Unlock()
+
+	if samplesBufferCount >= len(samplesLevels) {
+		//The buffer is already filled and another goroutine is checking the data
+		//drop those data samples
+		return
+	}
+
+	//Copy data to our buffer
+	start := samplesBufferCount / samplesCount
+	for i, _ := range pcmData {
+		samplesLevels[start+i] = pcmData[i]
+	}
+
+	//increment counter
+	samplesBufferCount += samplesCount
+
+	if samplesBufferCount >= len(samplesLevels) {
+		go checkLevels()
+	}
+}
+
+func checkLevels() {
+	//Calc the mean for the full range and if the level is >= of configured one, trigger actions
+	var mean float64
+	for _, v := range samplesLevels {
+		if v < 0 {
+			v = -v //Abs
+		}
+		mean += float64(v) / math.MaxInt16
+	}
+	mean /= float64(len(samplesLevels))
+
+	t := time.Now().Unix() - triggerTimestamp
+
+	if mean >= config.LevelTrigger.Level &&
+		t >= config.TriggerPauseSec {
+		log.Println("Level triggerd with:", mean, ". Calling actions.")
+		for _, action := range config.Actions {
+			go callAction(action.Type, action.Url, []byte(action.Payload))
+		}
+
+		triggerTimestamp = time.Now().Unix()
+	}
+
+	mutexBuff.Lock()
+	defer mutexBuff.Unlock()
+
+	samplesBufferCount = 0
+}
+
+func callAction(reqtype string, url string, data []byte) (_ []byte, err error) {
+	req, err := http.NewRequest(reqtype, url, bytes.NewBuffer(data))
+
+	log.Println("Call action:", url)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Println("Failed to call request to", url, err)
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	log.Println("Response Status:", resp.Status)
+	if resp.StatusCode >= http.StatusBadRequest {
+		return nil, err
+	}
+
+	return ioutil.ReadAll(resp.Body)
 }
